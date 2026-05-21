@@ -15,6 +15,8 @@ local MOTOR_FR = "Create_RotationSpeedController_1"
 local MOTOR_BL = "Create_RotationSpeedController_3"
 local MOTOR_BR = "Create_RotationSpeedController_2"
 
+local GIMBAL_NAME = "gimbal_sensor_3"
+
 local MONITOR_SIDE = "top"
 
 -- Altitude PID
@@ -23,11 +25,12 @@ local ALT_KI = 0.1
 local ALT_KD = 2.0
 
 -- Stabilization PID
-local STAB_KP = 3.0
-local STAB_KI = 0.1
-local STAB_KD = 0.0
+local STAB_KP = 0.5
+local STAB_KI = 0.0001
+local STAB_KD = 0.1
 
--- Max I contribution
+-- Stabilization correction limits
+local STAB_CORR_MIN, STAB_CORR_MAX = -80, 80
 local STAB_INTEG_MIN, STAB_INTEG_MAX = -20, 20
 
 -- Disturbance detection: when a large sudden tilt spike occurs (plane landing or departing)
@@ -56,11 +59,17 @@ local motorFR = peripheral.wrap(MOTOR_FR)
 local motorBL = peripheral.wrap(MOTOR_BL)
 local motorBR = peripheral.wrap(MOTOR_BR)
 
+-- Gimbal - .getAngles()
+-- a[1] --> yaw (+ left, - right)
+-- a[2] --> pitch (+ up, - down)
+local gimbal = peripheral.wrap(GIMBAL_NAME)
+
 if not motorFL then error("No motor: FL") end
 if not motorFR then error("No motor: FR") end
 if not motorBL then error("No motor: BL") end
 if not motorBR then error("No motor: BR") end
 if not monitor then error("No monitor")   end
+if not gimbal then error("No gimbal")     end
 
 monitor.setTextScale(0.5)
 monitor.clear()
@@ -73,8 +82,8 @@ local rollPID  = pid.new(0, STAB_KP, STAB_KI, STAB_KD)
 local pitchPID = pid.new(0, STAB_KP, STAB_KI, STAB_KD)
 rollPID:limitIntegral(STAB_INTEG_MIN, STAB_INTEG_MAX)
 pitchPID:limitIntegral(STAB_INTEG_MIN, STAB_INTEG_MAX)
-rollPID:clampOutput(-80, 80)
-pitchPID:clampOutput(-80, 80)
+rollPID:clampOutput(STAB_CORR_MIN, STAB_CORR_MAX)
+pitchPID:clampOutput(STAB_CORR_MIN, STAB_CORR_MAX)
 
 -- HELPERS
 local function displayLine(row, text)
@@ -86,12 +95,6 @@ end
 -- Clampinsons
 local function clamp(val, min, max)
     return math.max(min, math.min(max, val))
-end
-
--- Convert quaternion to Euler and get roll and pitch errors
-local function getTiltError(quat)
-    local pitch, yaw, roll = quat:toEuler()
-    return -roll, -pitch
 end
 
 -- Set motor speeds
@@ -143,7 +146,6 @@ local function controlLoop()
         -- Taking the data
         local pose     = sublevel.getLogicalPose()
         local pos      = pose.position
-        local quat     = pose.orientation
         local angVel   = sublevel.getAngularVelocity()
         local pressure = aero.getAirPressure(pos)
         local mass     = sublevel.getMass()
@@ -168,7 +170,9 @@ local function controlLoop()
         local baseRPM = ff + altCorr
 
         -- Stabilization
-        local rollErr, pitchErr = getTiltError(quat)
+        local tiltErr = gimbal.getAngles()
+        local rollErr = tiltErr[1]
+        local pitchErr = tiltErr[2]
 
         -- If detect large sudden tilt bleed integral
         if math.abs(rollErr) > DISTURBANCE_THRESHOLD then
@@ -182,14 +186,14 @@ local function controlLoop()
         local rollOutput  = rollPID:step(rollErr, dt)  - STAB_KD * angVel.z
         local pitchOutput = pitchPID:step(pitchErr, dt) - STAB_KD * angVel.x
 
-        rollOutput  = clamp(rollOutput,  -80, 80)
-        pitchOutput = clamp(pitchOutput, -80, 80)
+        rollOutput  = clamp(rollOutput,  STAB_CORR_MIN, STAB_CORR_MAX)
+        pitchOutput = clamp(pitchOutput, STAB_CORR_MIN, STAB_CORR_MAX)
 
         -- Motor mixing ---------------- WARNING: THIS IS PROBABLY NOT CORRECT FOR YOUR AIRCRAFT, TUNE CAREFULLY  ------------- use the little wand thingy to see if the roll and pitch outputs are going in the right direction, if not swap signs or something
-        local fl = baseRPM - rollOutput - pitchOutput
-        local fr = baseRPM + rollOutput - pitchOutput
-        local bl = baseRPM - rollOutput + pitchOutput
-        local br = baseRPM + rollOutput + pitchOutput
+        local fl = (baseRPM + pitchOutput) - rollOutput
+        local fr = (baseRPM + pitchOutput) + rollOutput
+        local bl = (baseRPM - pitchOutput) - rollOutput
+        local br = (baseRPM - pitchOutput) + rollOutput
 
         setMotorSpeeds(fl, fr, bl, br)
 
@@ -221,8 +225,10 @@ end
 local function inputLoop()
     while true do
         io.write("New altitude: ")
+
         local input = read()
         local newAlt = tonumber(input)
+
         if newAlt then
             TARGET_ALT = newAlt
             altPID.sp  = newAlt
@@ -230,10 +236,10 @@ local function inputLoop()
             altPID.prev_error = 0
             print("Target set to " .. newAlt .. " m")
         else
-            print("Invalid number, try again")
+            setMotorSpeeds(0, 0, 0, 0)
+            error("Terminated")
         end
     end
 end
-
 -- Run both loops in parallel
 parallel.waitForAny(controlLoop, inputLoop)
